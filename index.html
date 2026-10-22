@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>EngagementPortalMapGenerator</title>
+
+  <!-- Leaflet core -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Leaflet.draw -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+
+  <style>
+    html, body { height:100%; margin:0; font-family: system-ui,Segoe UI,Roboto,sans-serif }
+    #map { height:100vh; width:100% }
+    #panel {
+      position:absolute; right:12px; top:12px; z-index:1000;
+      background:rgba(255,255,255,0.96); padding:10px; border-radius:6px;
+      width:360px; max-height:80vh; overflow:auto; box-shadow:0 6px 18px rgba(0,0,0,.12); font-size:13px;
+    }
+    textarea{ width:100%; height:120px; font-family:monospace; font-size:12px }
+    button{ margin-top:6px; margin-right:6px }
+    #log{ margin-top:8px; color:#333; font-size:12px; white-space:pre-wrap; max-height:120px; overflow:auto; background:#fff7; padding:6px; border-radius:4px }
+    .muted{ color:#666; font-size:12px }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="panel" aria-label="Engagement Portal Map Generator controls">
+    <div><strong>Engagement Portal Map Generator</strong></div>
+    <div style="margin-top:8px" class="muted">Draw polyline (top-left) or load/paste GeoJSON. Snap to OSRM, export sanitized GeoJSON or export HTML.</div>
+
+    <div style="margin-top:8px">
+      <input id="fileInput" type="file" accept=".json,.geojson,application/geo+json" />
+      <button id="btnLoadFile">Load File</button>
+    </div>
+
+    <div style="margin-top:8px"><strong>Or paste GeoJSON</strong></div>
+    <textarea id="geojsonText" spellcheck="false" placeholder="Paste FeatureCollection or LineString GeoJSON here"></textarea>
+
+    <div>
+      <button id="btnLoadPaste">Load Paste</button>
+      <button id="btnExportGeo">Export Sanitized GeoJSON</button>
+      <button id="btnSnap">Snap to road (OSRM)</button>
+      <button id="btnExportHtml">Export HTML</button>
+      <button id="btnClear">Clear</button>
+    </div>
+
+    <div id="log">Status: initializing...</div>
+    <div style="margin-top:8px" class="muted">Tip: serve this folder over HTTP for full features (eg. <code>py -3 -m http.server 8000</code>).</div>
+  </div>
+
+  <script>
+    // on-page logger
+    const logEl = document.getElementById('log');
+    function log(msg, replace) {
+      if (replace) logEl.textContent = msg;
+      else logEl.textContent += (logEl.textContent ? '\n' : '') + msg;
+      logEl.scrollTop = logEl.scrollHeight;
+      console.log(msg);
+    }
+
+    // safety: ensure Leaflet loaded
+    if (typeof L === 'undefined') {
+      log('Leaflet failed to load. Check network or run via HTTP.', true);
+      throw new Error('Leaflet not loaded');
+    }
+
+    // validators & sanitizers
+    function isNumber(n){ return typeof n === 'number' && isFinite(n); }
+    function isValidCoordPair(c){ return Array.isArray(c) && c.length >= 2 && isNumber(c[0]) && isNumber(c[1]); }
+
+    function sanitizeLineStringCoords(coords){
+      if(!Array.isArray(coords)) return null;
+      const filtered = coords.filter(isValidCoordPair);
+      return filtered.length >= 2 ? filtered : null;
+    }
+
+    function sanitizeGeoJSON(geo){
+      if(!geo) return null;
+      if(geo.type === 'FeatureCollection' && Array.isArray(geo.features)){
+        const out={type:'FeatureCollection',features:[]};
+        for(const f of geo.features){
+          if(!f || !f.geometry || !f.geometry.type) continue;
+          const g = f.geometry;
+          if(g.type === 'LineString'){
+            const c = sanitizeLineStringCoords(g.coordinates);
+            if(c) out.features.push({ type:'Feature', properties: f.properties||{}, geometry:{ type:'LineString', coordinates: c }});
+          } else if (g.type === 'MultiLineString') {
+            const lines = Array.isArray(g.coordinates) ? g.coordinates : [];
+            const kept = lines.map(line => sanitizeLineStringCoords(line)).filter(x => x);
+            if(kept.length) out.features.push({ type:'Feature', properties: f.properties||{}, geometry:{ type:'MultiLineString', coordinates: kept }});
+          }
+        }
+        return out.features.length ? out : null;
+      }
+
+      if(geo.type === 'Feature' && geo.geometry){
+        const g = geo.geometry;
+        if(g.type === 'LineString'){
+          const c = sanitizeLineStringCoords(g.coordinates);
+          return c ? { type:'FeatureCollection', features:[{ type:'Feature', properties: geo.properties||{}, geometry:{ type:'LineString', coordinates: c }}]} : null;
+        }
+        if(g.type === 'MultiLineString'){
+          const c = Array.isArray(g.coordinates) ? g.coordinates.map(l => sanitizeLineStringCoords(l)).filter(x=>x) : [];
+          return c.length ? { type:'FeatureCollection', features:[{ type:'Feature', properties: geo.properties||{}, geometry:{ type:'MultiLineString', coordinates: c }}]} : null;
+        }
+        return null;
+      }
+
+      if(geo.type === 'LineString' && Array.isArray(geo.coordinates)){
+        const c = sanitizeLineStringCoords(geo.coordinates);
+        return c ? { type:'FeatureCollection', features:[{ type:'Feature', properties:{}, geometry:{ type:'LineString', coordinates: c }}]} : null;
+      }
+
+      return null;
+    }
+
+    function buildLatLngsFromGeoJSON(geo){
+      try {
+        const feat = (geo && geo.features && geo.features[0]) || geo;
+        if(!feat || !feat.geometry || !Array.isArray(feat.geometry.coordinates)) return null;
+        const coords = feat.geometry.coordinates;
+        const latlngs = coords.filter(isValidCoordPair).map(c => [c[1], c[0]]);
+        return latlngs.length >= 2 ? latlngs : null;
+      } catch(e){
+        console.error('buildLatLngsFromGeoJSON failed', e);
+        return null;
+      }
+    }
+
+    // map init
+    const map = L.map('map', { preferCanvas: true }).setView([40.75, -122.89], 11);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap contributors', maxZoom: 19 }).addTo(map);
+
+    const drawnItems = new L.FeatureGroup();
+    map.addLayer(drawnItems);
+
+    // draw controls
+    if (L.Control && L.Control.Draw) {
+      const drawControl = new L.Control.Draw({
+        position: 'topleft',
+        draw: { polyline: { shapeOptions: { color: '#ff0000', weight: 6, opacity: 0.95 } }, polygon: false, rectangle: false, circle: false, marker: false, circlemarker: false },
+        edit: { featureGroup: drawnItems, remove: true }
+      });
+      map.addControl(drawControl);
+    } else {
+      log('Leaflet.draw not available; draw controls disabled.', true);
+    }
+
+    let currentSanitizedGeo = null;
+
+    map.on(L.Draw.Event.CREATED, function (ev) {
+      const layer = ev.layer;
+      drawnItems.clearLayers(); drawnItems.addLayer(layer);
+      const geo = layer.toGeoJSON();
+      const sanitized = sanitizeGeoJSON(geo);
+      if (sanitized) {
+        currentSanitizedGeo = sanitized;
+        document.getElementById('geojsonText').value = JSON.stringify(sanitized, null, 2);
+        log('Drawn route sanitized and loaded', true);
+      } else {
+        currentSanitizedGeo = null;
+        log('Drawn route invalid', true);
+      }
+    });
+
+    map.on('draw:edited', function (e) {
+      let updated = null; e.layers.eachLayer(layer => updated = layer.toGeoJSON());
+      if (updated) {
+        const s = sanitizeGeoJSON(updated);
+        if (s) { currentSanitizedGeo = s; document.getElementById('geojsonText').value = JSON.stringify(s, null, 2); log('Edited route sanitized', true); }
+      }
+    });
+
+    map.on('draw:deleted', function () { drawnItems.clearLayers(); currentSanitizedGeo = null; document.getElementById('geojsonText').value = ''; log('Route deleted', true); });
+
+    // UI handlers
+    const fileInput = document.getElementById('fileInput');
+    const geojsonText = document.getElementById('geojsonText');
+
+    document.getElementById('btnLoadFile').addEventListener('click', () => {
+      const f = fileInput.files && fileInput.files[0];
+      if (!f) { alert('Choose a file first'); return; }
+      const r = new FileReader();
+      r.onload = ev => {
+        try { const parsed = JSON.parse(ev.target.result); geojsonText.value = JSON.stringify(parsed, null, 2); handleLoad(parsed); }
+        catch (e) { log('Parse error: ' + e.message); console.error(e); }
+      };
+      r.readAsText(f, 'utf-8');
+    });
+
+    document.getElementById('btnLoadPaste').addEventListener('click', () => {
+      if (!geojsonText.value) { alert('Paste GeoJSON first'); return; }
+      try { const parsed = JSON.parse(geojsonText.value); handleLoad(parsed); }
+      catch (e) { log('Invalid JSON: ' + e.message); console.error(e); }
+    });
+
+    function clearDrawnItemsAndAddLayerFromGeo(geo) {
+      drawnItems.clearLayers();
+      try {
+        const latlngs = buildLatLngsFromGeoJSON(geo);
+        if (!latlngs) return false;
+        const poly = L.polyline(latlngs, { color: '#ff0000', weight: 6, opacity: 0.95 });
+        drawnItems.addLayer(poly);
+        return true;
+      } catch (e) { console.error(e); return false; }
+    }
+
+    function handleLoad(parsed) {
+      const sanitized = sanitizeGeoJSON(parsed);
+      if (!sanitized) { log('Sanitization removed all features or found no valid LineString geometry', true); currentSanitizedGeo = null; drawnItems.clearLayers(); return; }
+      currentSanitizedGeo = sanitized;
+      geojsonText.value = JSON.stringify(sanitized, null, 2);
+      drawnItems.clearLayers();
+      const ok = clearDrawnItemsAndAddLayerFromGeo(sanitized);
+      if (ok) { const latlngs = buildLatLngsFromGeoJSON(sanitized); if (latlngs) map.fitBounds(L.latLngBounds(latlngs), { padding: [40, 40] }); }
+      log('Loaded and drawn sanitized GeoJSON', true);
+    }
+
+    document.getElementById('btnExportGeo').addEventListener('click', () => {
+      let geo = currentSanitizedGeo;
+      if (!geo) { const gj = drawnItems.toGeoJSON(); geo = sanitizeGeoJSON(gj); }
+      if (!geo) { alert('No sanitized geo to export'); return; }
+      const blob = new Blob([JSON.stringify(geo, null, 2)], { type: 'application/geo+json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = 'sanitized.geojson'; document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 3000);
+      log('Sanitized GeoJSON downloaded', true);
+    });
+
+    document.getElementById('btnClear').addEventListener('click', () => { drawnItems.clearLayers(); currentSanitizedGeo = null; geojsonText.value = ''; log('Cleared map and editor', true); });
+
+    // OSRM map-matching
+    async function osrmMatch(geo) {
+      if (!geo) throw new Error('No geo provided');
+      const f0 = (geo.features && geo.features[0]) || geo;
+      if (!f0 || !f0.geometry) throw new Error('No feature geometry found');
+      let coords = null;
+      if (f0.geometry.type === 'LineString') coords = f0.geometry.coordinates;
+      if (!coords || coords.length < 2) throw new Error('Not enough coords to match');
+      const MAX_POINTS = 200;
+      const step = Math.max(1, Math.ceil(coords.length / MAX_POINTS));
+      const sampled = coords.filter((_, i) => i % step === 0);
+      const coordStr = sampled.map(c => `${c[0]},${c[1]}`).join(';');
+      const url = `https://router.project-osrm.org/match/v1/driving/${coordStr}?geometries=geojson&overview=full&tidy=true`;
+      log('Calling OSRM match with ' + sampled.length + ' points...');
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error('OSRM returned ' + resp.status);
+      const json = await resp.json();
+      if (!json.matchings || !json.matchings.length) throw new Error('No matchings returned');
+      const newCoords = json.matchings[0].geometry.coordinates;
+      return { type: 'FeatureCollection', features: [{ type: 'Feature', properties: { matched: true }, geometry: { type: 'LineString', coordinates: newCoords } }] };
+    }
+
+    document.getElementById('btnSnap').addEventListener('click', async () => {
+      let geo = currentSanitizedGeo;
+      if (!geo) { const gj = drawnItems.toGeoJSON(); geo = sanitizeGeoJSON(gj); }
+      if (!geo) { alert('Load or draw a route first'); return; }
+      try {
+        log('Starting OSRM map-matching...', true);
+        const matched = await osrmMatch(geo);
+        currentSanitizedGeo = matched;
+        geojsonText.value = JSON.stringify(matched, null, 2);
+        drawnItems.clearLayers();
+        clearDrawnItemsAndAddLayerFromGeo(matched);
+        const latlngs = buildLatLngsFromGeoJSON(matched);
+        if (latlngs) map.fitBounds(L.latLngBounds(latlngs), { padding: [40, 40] });
+        log('OSRM matching complete - matched route drawn.', true);
+      } catch (e) {
+        log('Map-matching failed: ' + (e.message || e), true);
+        console.error(e);
+      }
+    });
+
+    // Export HTML (embed sanitized geo inside application/json script tag)
+    document.getElementById('btnExportHtml').addEventListener('click', () => {
+      let geo = currentSanitizedGeo;
+      if (!geo) { const gj = drawnItems.toGeoJSON(); geo = sanitizeGeoJSON(gj); }
+      if (!geo) { alert('No sanitized geo to embed'); return; }
+      try {
+        // Geo text (escape any closing script sequence just in case)
+        let geoText = JSON.stringify(geo, null, 2).replace(/<\/script>/g, '<\\/script>');
+
+        // build a safe document and serialize it
+        const doc = document.implementation.createHTMLDocument('EngagementPortalExport');
+        // head
+        doc.head.innerHTML = '<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>EngagementPortalExport</title><link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/><style>html,body{height:100%;margin:0}#map{height:100vh;width:100%}</style>';
+        // body
+        doc.body.innerHTML = '<div id="map"></div>';
+
+        // embed geo as application/json
+        const geoScript = doc.createElement('script');
+        geoScript.type = 'application/json';
+        geoScript.id = 'geo';
+        geoScript.textContent = geoText;
+        doc.body.appendChild(geoScript);
+
+        // add leaflet script
+        const leafletScript = doc.createElement('script');
+        leafletScript.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+        doc.body.appendChild(leafletScript);
+
+        // viewer script
+        const viewerScript = doc.createElement('script');
+        viewerScript.textContent = '(function(){try{const geo=JSON.parse(document.getElementById("geo").textContent);const map=L.map("map",{preferCanvas:true});L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{attribution:"© OpenStreetMap contributors",maxZoom:19}).addTo(map);function buildLatLngs(g){const feat=(g.features&&g.features[0])||g;if(!feat||!feat.geometry||!Array.isArray(feat.geometry.coordinates))return null;return feat.geometry.coordinates.filter(c=>Array.isArray(c)&&c.length>=2&&isFinite(c[0])&&isFinite(c[1])).map(c=>[c[1],c[0]]);}const latlngs=buildLatLngs(geo);if(!latlngs){map.setView([40.75,-122.89],11);console.error("No valid coords");}else{L.polyline(latlngs,{color:"#ff0000",weight:6,opacity:0.95}).addTo(map);try{const b=L.latLngBounds(latlngs);if(b&&b.isValid&&b.isValid())map.fitBounds(b,{padding:[40,40]});else map.setView(latlngs[0],13);}catch(e){console.error(e);map.setView(latlngs[0],13);}}}catch(e){console.error("Exported viewer error",e);}})();';
+        doc.body.appendChild(viewerScript);
+
+        const html = '<!doctype html>\n' + doc.documentElement.outerHTML;
+        const blob = new Blob([html], { type: 'text/html' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url; a.download = 'engagement-export.html'; document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+        log('Exported HTML download started.', true);
+      } catch (e) {
+        log('Export HTML failed: ' + (e && e.message ? e.message : e), true);
+        console.error(e);
+      }
+    });
+
+    log('Ready — draw/paste/load GeoJSON. Use Snap to OSRM or Export HTML to create standalone page.', true);
+
+    // minor rendering fix
+    setTimeout(() => map.invalidateSize(), 200);
+  </script>
+</body>
+</html>
